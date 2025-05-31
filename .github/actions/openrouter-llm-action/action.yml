@@ -1,0 +1,128 @@
+name: "OpenRouter LLM Action"
+description: "Run OpenRouter LLM in GitHub Actions workflows"
+
+inputs:
+  github_token: # This might not be needed anymore if not directly interacting with GitHub features within this action
+    description: "GitHub token with repo permissions (if needed by the prompt)"
+    required: false # Changed to false as it's not directly used by OpenRouter
+  openrouter_api_key:
+    description: "OpenRouter API key"
+    required: true
+  model_name:
+    description: "Name of the OpenRouter model to use (e.g., google/gemini-flash-1.5)"
+    required: true
+  prompt:
+    description: "The prompt to send to the OpenRouter LLM"
+    required: false
+    default: ""
+  prompt_file:
+    description: "Path to a file containing the prompt to send to the OpenRouter LLM"
+    required: false
+    default: ""
+  output_file:
+    description: "File to save LLM output to (optional)"
+    required: false
+    default: ""
+  timeout_minutes:
+    description: "Timeout in minutes for LLM API call"
+    required: false
+    default: "10"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare Prompt File
+      shell: bash
+      id: prepare_prompt
+      run: |
+        if [ -z "${{ inputs.prompt }}" ] && [ -z "${{ inputs.prompt_file }}" ]; then
+          echo "::error::Neither 'prompt' nor 'prompt_file' was provided. At least one is required."
+          exit 1
+        fi
+
+        if [ ! -z "${{ inputs.prompt_file }}" ]; then
+          if [ ! -f "${{ inputs.prompt_file }}" ]; then
+            echo "::error::Prompt file '${{ inputs.prompt_file }}' does not exist."
+            exit 1
+          fi
+          PROMPT_PATH="${{ inputs.prompt_file }}"
+        else
+          # Create a temporary directory if it doesn't exist
+          mkdir -p /tmp/openrouter-action
+          PROMPT_PATH="/tmp/openrouter-action/prompt.txt"
+          echo "${{ inputs.prompt }}" > "$PROMPT_PATH"
+        fi
+
+        if [ ! -s "$PROMPT_PATH" ]; then
+          echo "::error::Prompt is empty. Please provide a non-empty prompt."
+          exit 1
+        fi
+        echo "PROMPT_PATH=$PROMPT_PATH" >> $GITHUB_ENV
+
+    - name: Run OpenRouter API Call
+      shell: bash
+      id: run_openrouter
+      run: |
+        PROMPT_CONTENT=$(cat "${{ env.PROMPT_PATH }}")
+
+        # Construct JSON payload
+        JSON_PAYLOAD=$(jq -n \
+          --arg model "${{ inputs.model_name }}" \
+          --arg prompt_content "$PROMPT_CONTENT" \
+          '{model: $model, messages: [{role: "user", content: $prompt_content}]}')
+
+        echo "Sending request to OpenRouter API..."
+        echo "Payload: $JSON_PAYLOAD"
+
+        # Set a timeout to ensure the command doesn't run indefinitely
+        timeout_seconds=$((${{ inputs.timeout_minutes }} * 60))
+
+        API_RESPONSE_FILE="/tmp/openrouter-action/api_response.json"
+        HTTP_STATUS_CODE_FILE="/tmp/openrouter-action/http_status.txt"
+
+        # Make API call using curl
+        curl --request POST \
+             --url https://openrouter.ai/api/v1/chat/completions \
+             --header "Authorization: Bearer ${{ inputs.openrouter_api_key }}" \
+             --header "Content-Type: application/json" \
+             --data "$JSON_PAYLOAD" \
+             --output "$API_RESPONSE_FILE" \
+             --write-out "%{http_code}" \
+             --silent \
+             --connect-timeout 10 \
+             --max-time "$timeout_seconds" > "$HTTP_STATUS_CODE_FILE"
+
+        HTTP_STATUS_CODE=$(cat "$HTTP_STATUS_CODE_FILE")
+
+        echo "OpenRouter API call completed. HTTP Status Code: $HTTP_STATUS_CODE"
+        echo "API Response saved to $API_RESPONSE_FILE"
+
+        if [ "$HTTP_STATUS_CODE" -ne 200 ]; then
+          echo "::error::OpenRouter API request failed with status code $HTTP_STATUS_CODE."
+          echo "Response content:"
+          cat "$API_RESPONSE_FILE"
+          exit 1
+        fi
+
+        # Extract the message content
+        # Assuming the response structure is like: {"choices": [{"message": {"content": "..."}}]}
+        # Add error handling for jq parsing
+        MODEL_RESPONSE=$(jq -r '.choices[0].message.content // .error.message // "Error: Could not parse response"' "$API_RESPONSE_FILE")
+
+        if [ "$MODEL_RESPONSE" == "Error: Could not parse response" ] || echo "$MODEL_RESPONSE" | grep -q "error"; then
+          echo "::error::Failed to extract valid message content from OpenRouter response or API returned an error."
+          cat "$API_RESPONSE_FILE"
+          exit 1
+        fi
+
+        echo "Model response received."
+
+        if [ -z "${{ inputs.output_file }}" ]; then
+          echo "Outputting to console:"
+          echo "$MODEL_RESPONSE"
+        else
+          echo "$MODEL_RESPONSE" > "${{ inputs.output_file }}"
+          echo "Model response saved to ${{ inputs.output_file }}"
+        fi
+      env:
+        GITHUB_TOKEN: ${{ inputs.github_token }} # Still passing it, in case the prompt itself uses it somehow.

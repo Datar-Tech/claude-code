@@ -1,13 +1,16 @@
-name: "Claude Issue Triage Action"
-description: "Automatically triage GitHub issues using Claude Code"
+name: "Issue Triage Action (using OpenRouter)"
+description: "Automatically triage GitHub issues using an LLM via OpenRouter"
 
 inputs:
   timeout_minutes:
     description: "Timeout in minutes for execution"
     required: false
     default: "5"
-  anthropic_api_key:
-    description: "Anthropic API key"
+  openrouter_api_key:
+    description: "OpenRouter API key"
+    required: true
+  model_name:
+    description: "Name of the OpenRouter model to use (e.g., google/gemini-flash-1.5)"
     required: true
   github_token:
     description: "GitHub token with repo and issues permissions"
@@ -19,69 +22,124 @@ runs:
     - name: Checkout repository code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0
+        fetch-depth: 0 # Necessary if scripts or local files are involved, good practice.
 
-    - name: Create prompt file
+    - name: Gather Issue Data and Available Labels
+      id: gather_data
       shell: bash
       run: |
-        mkdir -p /tmp/claude-prompts
-        cat > /tmp/claude-prompts/claude-issue-triage-prompt.txt << 'EOF'
-        You're an issue triage assistant for GitHub issues. Your task is to analyze the issue and select appropriate labels from the provided list.
+        echo "Fetching available labels..."
+        gh label list --json name > /tmp/repo_labels.json
+        if [ $? -ne 0 ]; then
+          echo "::error::Failed to fetch repository labels."
+          exit 1
+        fi
+        echo "Labels fetched."
 
-        IMPORTANT: Don't post any comments or messages to the issue. Your only action should be to apply labels.
+        echo "Fetching issue data for issue #${{ github.event.issue.number }}..."
+        gh issue view "${{ github.event.issue.number }}" --json title,body,comments > /tmp/issue_data.json
+        if [ $? -ne 0 ]; then
+          echo "::error::Failed to fetch issue data for issue #${{ github.event.issue.number }}."
+          exit 1
+        fi
+        echo "Issue data fetched."
+      env:
+        GH_TOKEN: ${{ inputs.github_token }} # gh cli needs this
 
-        Issue Information:
-        - REPO: ${{ github.repository }}
-        - ISSUE_NUMBER: ${{ github.event.issue.number }}
+    - name: Create Prompt for LLM
+      id: create_prompt
+      shell: bash
+      run: |
+        REPO_LABELS_JSON=$(cat /tmp/repo_labels.json)
+        ISSUE_DATA_JSON=$(cat /tmp/issue_data.json)
 
-        TASK OVERVIEW:
+        # Extract data using jq for safer handling
+        ISSUE_TITLE=$(echo "$ISSUE_DATA_JSON" | jq -r .title)
+        ISSUE_BODY=$(echo "$ISSUE_DATA_JSON" | jq -r .body)
+        # For comments, let's concatenate them. Max 3 comments to keep prompt size manageable.
+        ISSUE_COMMENTS=$(echo "$ISSUE_DATA_JSON" | jq -r '.comments[:3] | .[] | .body' | paste -sd '
+---
+')
 
-        1. First, fetch the list of labels available in this repository by running: `gh label list`. Run exactly this command with nothing else.
+        AVAILABLE_LABELS=$(echo "$REPO_LABELS_JSON" | jq -r '[.[].name] | join(", ")')
 
-        2. Next, use the GitHub tools to get context about the issue:
-           - You have access to these tools:
-             - mcp__github__get_issue: Use this to retrieve the current issue's details including title, description, and existing labels
-             - mcp__github__get_issue_comments: Use this to read any discussion or additional context provided in the comments
-             - mcp__github__update_issue: Use this to apply labels to the issue (do not use this for commenting)
-             - mcp__github__search_issues: Use this to find similar issues that might provide context for proper categorization and to identify potential duplicate issues
-             - mcp__github__list_issues: Use this to understand patterns in how other issues are labeled
-           - Start by using mcp__github__get_issue to get the issue details
+        PROMPT_TEXT=$(cat <<EOF
+You are an AI assistant for GitHub issue triage.
+Your task is to analyze the provided issue details and suggest appropriate labels from the list of available labels.
 
-        3. Analyze the issue content, considering:
-           - The issue title and description
-           - The type of issue (bug report, feature request, question, etc.)
-           - Technical areas mentioned
-           - Severity or priority indicators
-           - User impact
-           - Components affected
+**Available Labels:**
+$AVAILABLE_LABELS
 
-        4. Select appropriate labels from the available labels list provided above:
-           - Choose labels that accurately reflect the issue's nature
-           - Be specific but comprehensive
-           - Select priority labels if you can determine urgency (high-priority, med-priority, or low-priority)
-           - Consider platform labels (android, ios) if applicable
-           - If you find similar issues using mcp__github__search_issues, consider using a "duplicate" label if appropriate. Only do so if the issue is a duplicate of another OPEN issue.
+**Issue Details:**
+* **Title:** $ISSUE_TITLE
+* **Body:**
+$ISSUE_BODY
+* **Recent Comments (up to 3):**
+$ISSUE_COMMENTS
 
-        5. Apply the selected labels:
-           - Use mcp__github__update_issue to apply your selected labels
-           - DO NOT post any comments explaining your decision
-           - DO NOT communicate directly with users
-           - If no labels are clearly applicable, do not apply any labels
+**Instructions:**
+1. Carefully review all the provided information about the issue.
+2. Based on your analysis, decide which of the "Available Labels" are most appropriate for this issue.
+3. Your output MUST be a JSON array of strings, where each string is an exact label name from the "Available Labels" list. For example: ["bug", "documentation"]
+4. If no labels seem appropriate, or you are unsure, output an empty JSON array: [].
+5. Do NOT include any explanations, apologies, or any text other than the JSON array of label names.
 
-        IMPORTANT GUIDELINES:
-        - Be thorough in your analysis
-        - Only select labels from the provided list above
-        - DO NOT post any comments to the issue
-        - Your ONLY action should be to apply labels using mcp__github__update_issue
-        - It's okay to not add any labels if none are clearly applicable
-        EOF
+Output the JSON array of chosen label names:
+EOF
+)
+        echo "Generated prompt:"
+        echo "$PROMPT_TEXT" # For debugging in logs
 
-    - name: Run Claude Code
-      uses: ./.github/actions/claude-code-action
+        mkdir -p /tmp/openrouter-prompts
+        echo "$PROMPT_TEXT" > /tmp/openrouter-prompts/issue-triage-prompt.txt
+        echo "Prompt file created at /tmp/openrouter-prompts/issue-triage-prompt.txt"
+
+    - name: Run LLM for Issue Triage
+      id: llm_triage # Give it an ID to access its outputs if the called action provides them directly (not the case here, uses files)
+      uses: ./.github/actions/openrouter-llm-action
       with:
-        prompt_file: /tmp/claude-prompts/claude-issue-triage-prompt.txt
-        allowed_tools: "Bash(gh label list),mcp__github__get_issue,mcp__github__get_issue_comments,mcp__github__update_issue,mcp__github__search_issues,mcp__github__list_issues"
-        install_github_mcp: "true"
+        prompt_file: /tmp/openrouter-prompts/issue-triage-prompt.txt
+        output_file: /tmp/openrouter-prompts/llm_suggested_labels.json # LLM action writes here
         timeout_minutes: ${{ inputs.timeout_minutes }}
-        anthropic_api_key: ${{ inputs.anthropic_api_key }}
-        github_token: ${{ inputs.github_token }}
+        openrouter_api_key: ${{ inputs.openrouter_api_key }}
+        model_name: ${{ inputs.model_name }}
+        github_token: ${{ inputs.github_token }} # The LLM action itself doesn't use it, but good to pass if prompt could evolve
+
+    - name: Apply Suggested Labels
+      shell: bash
+      run: |
+        echo "LLM output received. Attempting to apply labels..."
+        SUGGESTED_LABELS_JSON_PATH="/tmp/openrouter-prompts/llm_suggested_labels.json"
+
+        if [ ! -f "$SUGGESTED_LABELS_JSON_PATH" ]; then
+          echo "::error::LLM output file $SUGGESTED_LABELS_JSON_PATH not found."
+          exit 1
+        fi
+
+        echo "LLM response content:"
+        cat "$SUGGESTED_LABELS_JSON_PATH"
+
+        # Validate JSON and extract labels
+        # Using jq to parse the JSON array of strings
+        LABELS_TO_APPLY=$(jq -r '.[]' "$SUGGESTED_LABELS_JSON_PATH")
+
+        if [ -z "$LABELS_TO_APPLY" ]; then
+          echo "No labels suggested by the LLM, or failed to parse labels."
+          exit 0 # Exit gracefully, not an error
+        fi
+
+        echo "Labels to apply:"
+        echo "$LABELS_TO_APPLY"
+
+        for label in $LABELS_TO_APPLY; do
+          # It's important to quote "$label" in case labels have spaces, though GH labels typically don't.
+          echo "Applying label: $label"
+          gh issue edit "${{ github.event.issue.number }}" --add-label "$label"
+          if [ $? -ne 0 ]; then
+            echo "::warning::Failed to apply label '$label'. It might already exist or be invalid."
+          else
+            echo "Successfully applied label: $label"
+          fi
+        done
+      env:
+        GH_TOKEN: ${{ inputs.github_token }}

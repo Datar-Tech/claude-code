@@ -1,5 +1,5 @@
-name: Claude Issue Triage
-description: "Automatically triage GitHub issues using Claude Code"
+name: OpenRouter Issue Triage
+description: "Automatically triage GitHub issues using OpenRouter"
 
 on:
   issues:
@@ -16,8 +16,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Run Claude Issue Triage
+      - name: Run OpenRouter Issue Triage
         uses: ./.github/actions/claude-issue-triage-action
         with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          openrouter_api_key: ${{ secrets.OPENROUTER_API_KEY }}
+          model_name: 'google/gemini-flash-1.5'
           github_token: ${{ secrets.GITHUB_TOKEN }}
